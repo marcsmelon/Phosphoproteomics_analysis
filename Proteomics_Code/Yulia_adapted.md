@@ -1,0 +1,1266 @@
+---
+title: "NRG1 vs Scramble Proteomics Analysis (24h)"
+author: "Marc Cantero"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: journal
+    highlight: kate
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Set your working directory explicitly - change this path to your project folder
+project_dir <- getwd()  # Or use an explicit path like: "/Users/marc/Projects/NRG1_Proteomics"
+knitr::opts_knit$set(root.dir = project_dir)
+setwd(project_dir)
+
+cat("Working directory set to:", project_dir, "\n")
+```
+
+### Loading Required Packages
+
+```{r load_packages, include=FALSE, echo=FALSE, message=FALSE}
+suppressPackageStartupMessages({
+  library(readxl)
+  library(limma)
+  library(showtext)
+  library(viridis)
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+  library(reshape2)
+  library(tidyr)
+  library(stringr)
+  library(kableExtra)
+  library(readr)
+  library(pheatmap)
+  library(Biobase)
+  library(tidyverse)
+  library(gprofiler2)
+  library(ComplexHeatmap)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(GO.db)
+  library(enrichplot)
+  library(VennDiagram)
+  library(sysfonts)
+  library(rcartocolor)
+})
+```
+
+### Setting Up Visuals
+
+```{r HERD_visual}
+herd_palette <- c(
+  "#14767F",  # RENEW Teal (dark teal)
+
+  "#D55E00",  # Oxygenated Red (orange-red)
+  "#117733",  # Leaf Green (dark green)
+  "#882255",  # Deep Burgundy (dark purple-red)
+  "#0072B2",  # Primary Blue (medium blue)
+  "#E69F00",  # Bright Orange (gold-orange)
+  "#6BC3B3",  # RENEW Aqua (light teal)
+  "#2E0854",  # Indigo (very dark purple)
+  "#44AA44",  # Positive Green (bright green)
+  "#722F37",  # Wine (dark red)
+  "#87CEEB",  # Sky Blue (light blue)
+  "#F1C232",  # Light Gold (yellow-gold)
+  "#50C878",  # Emerald (medium green)
+  "#CC79A7",  # Cool Purple (pink-purple)
+  "#001F3F",  # Navy (very dark blue)
+  "#CCFF00",  # Lime (bright yellow-green)
+  "#FFB6C1",  # Hot Pink (light pink)
+  "#4A2511",  # Chocolate (dark brown)
+  "#9370DB",  # Violet (medium purple)
+  "#F4E4C1",  # Sand (light beige)
+  "#FF4444",  # Vermilion (bright red)
+  "#00D9A3",  # Bluish Green (bright cyan)
+  "#FFFF00",  # Yellow (pure yellow)
+  "#999999",  # Slate Grey (medium grey)
+  "#E6E6FA",  # Lavender (very light purple)
+  "#000000"   # Black
+)
+
+# Custom scale functions
+scale_fill_herd <- function(values = NULL, n_colors = NULL, ...) {
+  scale_fill_manual(
+    values = values %||% herd_palette[seq_len(n_colors %||% length(herd_palette))],
+    ...
+  )
+}
+
+scale_color_herd <- function(values = NULL, n_colors = NULL, ...) {
+  scale_color_manual(
+    values = values %||% herd_palette[seq_len(n_colors %||% length(herd_palette))],
+    ...
+  )
+}
+
+# Treatment colors for your comparison
+treatment_colors <- c(
+  "Scramble" = "#999999",   # Control (Healthy)
+  "NRG1" = "#9370DB"        # Treatment (Disease)
+)
+```
+
+### Loading and Preprocessing the Dataset
+
+```{r load_proteomics_data}
+# Read the Excel file - adjust path as needed
+proteomics_data <- General_proteome_WithIBAQ_0_24
+
+# View structure
+cat("Dataset dimensions:", dim(proteomics_data), "\n")
+cat("Column names:\n")
+print(colnames(proteomics_data))
+```
+
+```{r preprocessing}
+# Create a clean copy
+proteomics_clean <- proteomics_data
+
+# Remove Fasta.headers and iBAQ.peptides columns (metadata, not needed for LFQ analysis)
+proteomics_clean <- proteomics_clean[, !names(proteomics_clean) %in% c("Fasta.headers", "iBAQ.peptides")]
+
+# Identify LFQ columns
+lfq_cols <- grep("^LFQ\\.intensity\\.", names(proteomics_clean), value = TRUE)
+cat("LFQ columns found:\n")
+print(lfq_cols)
+
+# Create proteome dataframe with necessary columns
+proteome <- proteomics_clean[, c("Protein.IDs", "Majority.protein.IDs", 
+                                  "Protein.names", "Gene.names", 
+                                  lfq_cols)]
+
+# Clean column names - remove LFQ.intensity. prefix
+colnames(proteome) <- gsub("^LFQ\\.intensity\\.", "", colnames(proteome))
+
+# Clean up empty gene names
+proteome$Gene.names[proteome$Gene.names == ""] <- NA
+
+# View the cleaned data
+cat("\nProteome dataset dimensions:", dim(proteome), "\n")
+print(head(proteome))
+```
+
+```{r adding_single_uniprot_name, warning=FALSE}
+# Extract the first Uniprot ID from Majority.protein.IDs column
+proteome$UniprotID <- sapply(strsplit(as.character(proteome$Majority.protein.IDs), ";"), function(x) x[1])
+
+# Reorder columns to put UniprotID after Gene.names
+gene_names_pos <- which(colnames(proteome) == "Gene.names")
+other_cols <- setdiff(colnames(proteome), "UniprotID")
+col_order <- c(
+  other_cols[1:gene_names_pos],
+  "UniprotID",
+  other_cols[(gene_names_pos + 1):length(other_cols)]
+)
+
+proteome <- proteome[, col_order]
+print(head(proteome))
+```
+
+### Quality Control
+
+```{r targets}
+# Define sample information
+# Your samples: NRG124h_1_Disease, NRG124h_2_Disease, NRG124h_3_Disease, 
+#               Scramble_1_Healthy, Scramble_2_Healthy, Scramble_3_Healthy
+
+sample_cols <- colnames(proteome)[6:11]  # LFQ intensity columns
+
+targets <- data.frame(Sample = sample_cols)
+
+# Extract treatment from sample names (match NRG1 anywhere in name)
+targets$Treatment <- ifelse(grepl("NRG1", targets$Sample), "NRG1", "Scramble")
+
+# Extract replicate number
+targets$Rep <- gsub(".*_(\\d+)_.*", "\\1", targets$Sample)
+
+# Extract condition (Disease/Healthy)
+targets$Condition <- ifelse(grepl("Disease", targets$Sample), "Disease", "Healthy")
+
+targets %>%
+  kable(caption = "Sample Information",
+        col.names = c("Sample", "Treatment", "Replicate", "Condition")) %>% 
+  kable_styling(bootstrap_options = c("striped", "bordered", "hover"),
+                full_width = FALSE,
+                position = "center") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#14767F") %>%
+  column_spec(1:4, extra_css = "font-family: 'Helvetica', sans-serif; padding: 10px;")
+```
+
+```{r create_output_dirs}
+# Create results directories
+if (!dir.exists("results/qc")) {
+  dir.create("results/qc", recursive = TRUE)
+}
+if (!dir.exists("results/differential")) {
+  dir.create("results/differential", recursive = TRUE)
+}
+if (!dir.exists("results/volcano")) {
+  dir.create("results/volcano", recursive = TRUE)
+}
+```
+
+```{r non-zero_proteins, fig.align="center", fig.width=10, fig.height=6, dpi=300, dev="png"}
+# Replace NAs with 0 for counting (only in LFQ columns)
+proteome_PI <- proteome
+proteome_PI[sample_cols][is.na(proteome_PI[sample_cols])] <- 0
+
+# Count proteins with intensity > 0 per sample
+tmp <- data.frame(
+  Sample = sample_cols, 
+  Total_proteins = colSums(proteome_PI[sample_cols] > 0)
+)
+
+# Match samples to treatments
+tmp$Group <- targets$Treatment[match(tmp$Sample, targets$Sample)]
+
+# Create the plot
+p <- ggplot(tmp, aes(x = Sample, y = Total_proteins, fill = Group)) + 
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = treatment_colors) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max(tmp$Total_proteins) * 1.05)) +
+  labs(title = "Proteins with intensity > 0",
+       x = "Sample",
+       y = "Number of Proteins",
+       fill = "Treatment") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("results/qc/proteins_intensity_plot.svg", plot = p, width = 10, height = 6, device = "svg")
+ggsave("results/qc/proteins_intensity_plot.jpeg", plot = p, width = 10, height = 6, device = "jpeg", dpi = 300)
+print(p)
+```
+
+```{r total_library_size, fig.align="center", fig.width=10, fig.height=6, dpi=300, dev="png"}
+tmp <- data.frame(
+  Sample = sample_cols, 
+  Total_intensities = colSums(proteome[sample_cols], na.rm = TRUE)
+)
+tmp$Group <- targets$Treatment[match(tmp$Sample, targets$Sample)]
+tmp <- tmp[order(tmp$Group), ]
+tmp$Sample <- factor(tmp$Sample, levels = tmp$Sample)
+
+# Create the plot
+p <- ggplot(tmp, aes(x = Sample, y = Total_intensities, fill = Group)) + 
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = treatment_colors) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(title = "Library size",
+       x = "Sample",
+       y = "Total Intensities",
+       fill = "Treatment") +
+  theme_classic() + 
+  theme(
+    axis.text.x = element_text(hjust = 1, vjust = 0.5, angle = 90), 
+    plot.title = element_text(hjust = 0.5)
+  )
+
+ggsave("results/qc/Total_Library_Size.svg", plot = p, width = 10, height = 6, device = "svg")
+ggsave("results/qc/Total_Library_Size.jpeg", plot = p, width = 10, height = 6, device = "jpeg", dpi = 300)
+print(p)
+```
+
+```{r log2_plot, fig.align="center", fig.width=10, fig.height=6, dpi=300, dev="png"}
+par(bty = "L")
+group_factor <- factor(targets$Treatment[match(sample_cols, targets$Sample)])
+plotDensities(log2(proteome[sample_cols]), 
+              group = group_factor,
+              col = treatment_colors[levels(group_factor)],
+              legend = "topright",
+              main = "Log2 Intensity Distribution (Raw)")
+
+# Save to results folder
+svg("results/qc/Density_Plot_Raw.svg", width = 10, height = 6)
+par(bty = "L")
+plotDensities(log2(proteome[sample_cols]), 
+              group = group_factor,
+              col = treatment_colors[levels(group_factor)],
+              legend = "topright",
+              main = "Log2 Intensity Distribution (Raw)")
+invisible(dev.off())
+
+jpeg("results/qc/Density_Plot_Raw.jpeg", width = 10, height = 6, units = "in", res = 300)
+par(bty = "L")
+plotDensities(log2(proteome[sample_cols]), 
+              group = group_factor,
+              col = treatment_colors[levels(group_factor)],
+              legend = "topright",
+              main = "Log2 Intensity Distribution (Raw)")
+invisible(dev.off())
+```
+
+### Preprocessing
+
+Data pre-processing workflow:
+
+1. **Filter by Presence**: Protein should be present in at least 2 out of 3 replicates in at least one condition
+2. **Log2-transformation**: Variance stabilization
+3. **Median Centering**: Normalization to address multiplicative noise
+
+```{r elist_creation}
+# Set row names using Gene.names and UniprotID
+rownames(proteome) <- paste(proteome$Gene.names, proteome$UniprotID, sep = "_")
+
+# Create EList object
+group <- as.factor(targets$Treatment)
+
+proteome_Elist <- new("EList", list(
+  E = as.matrix(proteome[sample_cols]), 
+  genes = proteome[, 1:5],  # Gene annotation columns
+  group = group[match(sample_cols, targets$Sample)]
+))
+
+cat("Initial EList dimensions:", dim(proteome_Elist$E), "\n")
+```
+
+```{r elist_observed}
+# Convert zeros to NA
+proteome_Elist$E[proteome_Elist$E == 0] <- NA
+
+# Basic presence filter - keep proteins detected in at least 3 samples
+is.exprs <- rowSums(!is.na(proteome_Elist$E)) >= 3
+proteome_Elist$E <- proteome_Elist$E[is.exprs, ]
+proteome_Elist$genes <- proteome_Elist$genes[is.exprs, ]
+
+# Ensure rownames are preserved in genes
+rownames(proteome_Elist$genes) <- rownames(proteome_Elist$E)
+
+cat("After basic filtering:\n")
+cat("  Proteins retained:", sum(is.exprs), "\n")
+cat("  Proteins removed:", sum(!is.exprs), "\n")
+
+# Missingness summary
+cat("\nMissing values per sample:\n")
+print(colSums(is.na(proteome_Elist$E)))
+cat("\nProteins with >50% missing:", sum(rowMeans(is.na(proteome_Elist$E)) > 0.5), "\n")
+```
+
+### Filtering
+
+```{r elist_filtering}
+# NRG1 samples (columns 1-3: NRG124h_1_Disease, NRG124h_2_Disease, NRG124h_3_Disease)
+is.exprs.nrg1 <- rowSums(!is.na(proteome_Elist$E[, 1:3]) & proteome_Elist$E[, 1:3] != 0, na.rm = TRUE) >= 2
+
+# Scramble samples (columns 4-6: Scramble_1_Healthy, Scramble_2_Healthy, Scramble_3_Healthy)
+is.exprs.scramble <- rowSums(!is.na(proteome_Elist$E[, 4:6]) & proteome_Elist$E[, 4:6] != 0, na.rm = TRUE) >= 2
+
+# Keep proteins present in at least one condition
+is.exprs <- is.exprs.nrg1 | is.exprs.scramble
+
+cat("Filtering summary:\n")
+cat("  Proteins in NRG1 (>=2/3 reps):", sum(is.exprs.nrg1), "\n")
+cat("  Proteins in Scramble (>=2/3 reps):", sum(is.exprs.scramble), "\n")
+cat("  Proteins retained (union):", sum(is.exprs), "\n")
+
+proteome_Elist$E <- proteome_Elist$E[is.exprs, ]
+proteome_Elist$genes <- proteome_Elist$genes[is.exprs, ]
+proteome_Elist$group <- as.factor(targets$Treatment[match(colnames(proteome_Elist$E), targets$Sample)])
+
+# Ensure rownames are preserved in genes
+rownames(proteome_Elist$genes) <- rownames(proteome_Elist$E)
+```
+
+```{r filtering_plot, fig.align="center", fig.width=10, fig.height=6, dpi=300, dev="png"}
+tmp <- data.frame(
+  Sample = colnames(proteome_Elist$E), 
+  Proportion = colMeans(!is.na(proteome_Elist$E)),
+  Group = group[match(colnames(proteome_Elist$E), targets$Sample)]
+)
+
+tmp <- tmp[order(tmp$Group), ]
+tmp$Sample <- factor(tmp$Sample, levels = tmp$Sample)
+
+p <- ggplot(tmp, aes(x = Sample, y = Proportion, fill = Group)) + 
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = treatment_colors) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1)) +
+  labs(title = "Proportion of Features Present After Filtering",
+       x = "Sample",
+       y = "Proportion") +
+  theme_classic() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 0.5, angle = 90), 
+        plot.title = element_text(hjust = 0.5))
+
+print(p)
+ggsave("results/qc/Proportion_Features_Filtered.svg", plot = p, width = 10, height = 6, device = "svg")
+ggsave("results/qc/Proportion_Features_Filtered.jpeg", plot = p, width = 10, height = 6, device = "jpeg", dpi = 300)
+```
+
+```{r log2}
+proteome_Elist_log2 <- proteome_Elist
+proteome_Elist_log2$E <- log2(proteome_Elist$E)
+
+cat("Raw intensities summary:\n")
+print(summary(c(proteome_Elist$E)))
+cat("\nLog2 intensities summary:\n")
+print(summary(c(proteome_Elist_log2$E)))
+cat("\nDimensions:", dim(proteome_Elist_log2), "\n")
+```
+
+```{r median_center_function}
+median_center <- function(x) {
+  centered <- apply(x, 2, function(y) {
+    med <- median(y, na.rm = TRUE)
+    y - med
+  })
+  return(centered)
+}
+```
+
+```{r median_centering}
+proteome_Elist_centered <- proteome_Elist_log2
+proteome_Elist_centered$E <- median_center(proteome_Elist_log2$E)
+
+# Report median centering values
+centering_values <- apply(proteome_Elist_log2$E, 2, median, na.rm = TRUE)
+cat("Median centering values applied:\n")
+print(centering_values)
+```
+
+```{r log2_plot_post_processing, fig.align="center", fig.width=10, fig.height=6, dpi=300, dev="png"}
+par(bty = "L")
+plotDensities(proteome_Elist_centered$E, 
+              group = droplevels(group[match(colnames(proteome_Elist_centered$E), targets$Sample)]),
+              col = treatment_colors,
+              legend = "topright",
+              main = "Log2 Intensity Distribution (After Normalization)")
+```
+
+```{r RLE_plot_post_processing, fig.align="center", fig.width=10, fig.height=6, dpi=300, dev="png"}
+sample_treatments <- targets$Treatment[match(colnames(proteome_Elist_centered$E), targets$Sample)]
+plot_colors <- treatment_colors[sample_treatments]
+
+boxplot(proteome_Elist_centered$E - rowMedians(as.matrix(proteome_Elist_centered$E), na.rm = TRUE), 
+        col = plot_colors,
+        las = 2,
+        main = "RLE - Normalized Non-imputed Intensities")
+abline(h = 0)
+```
+
+### MDS and PCA
+
+```{r mds, fig.align="center", echo=FALSE, fig.width=10, fig.height=8, dpi=300, dev="png"}
+treatments <- targets$Treatment[match(colnames(proteome_Elist_centered$E), targets$Sample)]
+
+plotMDS(proteome_Elist_centered, 
+       col = treatment_colors[treatments],
+       pch = 16,
+       cex = 2,
+       main = "MDS After Normalization")
+
+legend("topright", 
+      legend = unique(treatments), 
+      col = treatment_colors[unique(treatments)],
+      pch = 16,
+      bty = "n")
+```
+
+```{r PCA_plot_post_processing, fig.align="center", fig.width=10, fig.height=8, dpi=300, dev="png"}
+# Perform PCA on complete cases
+pca_data <- prcomp(t(na.omit(proteome_Elist_centered$E)), scale. = TRUE)
+
+# Calculate variance explained
+var_explained <- round(100 * pca_data$sdev^2 / sum(pca_data$sdev^2), 1)
+
+# Prepare plot data
+plotMe <- as.data.frame(pca_data$x[, 1:2])
+plotMe <- rownames_to_column(plotMe, var = "Sample")
+plotMe$Treatment <- targets$Treatment[match(plotMe$Sample, targets$Sample)]
+plotMe$Condition <- targets$Condition[match(plotMe$Sample, targets$Sample)]
+
+# Create PCA plot
+p <- ggplot(plotMe, aes(x = PC1, y = PC2, color = Treatment, label = Sample)) + 
+  geom_point(size = 4) +
+  geom_text_repel(size = 3, max.overlaps = 10) +
+  scale_color_manual(values = treatment_colors) +
+  theme_classic() + 
+  labs(title = "PCA: PC1 vs PC2",
+       x = paste0("PC1 (", var_explained[1], "%)"),
+       y = paste0("PC2 (", var_explained[2], "%)"))
+
+print(p)
+ggsave("results/qc/PCA_plot.svg", plot = p, width = 10, height = 8, device = "svg")
+ggsave("results/qc/PCA_plot.jpeg", plot = p, width = 10, height = 8, device = "jpeg", dpi = 300)
+```
+
+```{r sample_correlation_heatmap, fig.align="center", fig.width=8, fig.height=8, dpi=300, dev="png"}
+# Sample correlation heatmap to check replicate consistency
+cor_matrix <- cor(proteome_Elist_centered$E, use = "pairwise.complete.obs")
+
+# Annotation for samples
+cor_anno <- data.frame(
+  Treatment = targets$Treatment[match(colnames(cor_matrix), targets$Sample)]
+)
+rownames(cor_anno) <- colnames(cor_matrix)
+
+cor_colors <- list(Treatment = treatment_colors)
+
+# Correlation heatmap palette (blue to white to red)
+cor_palette <- colorRampPalette(c("#0072B2", "white", "#D55E00"))(100)
+
+pheatmap(cor_matrix,
+         display_numbers = TRUE,
+         number_format = "%.3f",
+         fontsize_number = 9,
+         annotation_col = cor_anno,
+         annotation_row = cor_anno,
+         annotation_colors = cor_colors,
+         color = cor_palette,
+         breaks = seq(min(cor_matrix, na.rm = TRUE), 1, length.out = 101),
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         fontsize = 10,
+         border_color = NA,
+         main = "Sample Correlation Heatmap",
+         filename = "results/qc/Sample_Correlation_Heatmap.svg",
+         width = 8, height = 8)
+
+pheatmap(cor_matrix,
+         display_numbers = TRUE,
+         number_format = "%.3f",
+         fontsize_number = 9,
+         annotation_col = cor_anno,
+         annotation_row = cor_anno,
+         annotation_colors = cor_colors,
+         color = cor_palette,
+         breaks = seq(min(cor_matrix, na.rm = TRUE), 1, length.out = 101),
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         fontsize = 10,
+         border_color = NA,
+         main = "Sample Correlation Heatmap",
+         filename = "results/qc/Sample_Correlation_Heatmap.jpeg",
+         width = 8, height = 8)
+
+# Display in notebook
+pheatmap(cor_matrix,
+         display_numbers = TRUE,
+         number_format = "%.3f",
+         fontsize_number = 9,
+         annotation_col = cor_anno,
+         annotation_row = cor_anno,
+         annotation_colors = cor_colors,
+         color = cor_palette,
+         breaks = seq(min(cor_matrix, na.rm = TRUE), 1, length.out = 101),
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         fontsize = 10,
+         border_color = NA,
+         main = "Sample Correlation Heatmap")
+```
+
+### Saving Processed Data
+
+```{r saving_proteome_elist}
+saveRDS(proteome_Elist_centered, file = "proteome_Elist_centered.rds")
+cat("Processed data saved to: proteome_Elist_centered.rds\n")
+```
+
+### Differential Analysis
+
+```{r limma_design}
+# Simple design for NRG1 vs Scramble comparison
+# Ensure Treatment is a factor
+targets$Treatment <- factor(targets$Treatment, levels = c("Scramble", "NRG1"))
+
+design <- model.matrix(~ 0 + Treatment, data = targets)
+colnames(design) <- gsub("Treatment", "", colnames(design))
+
+cat("Design matrix:\n")
+print(design)
+cat("\nSample distribution:\n")
+print(table(targets$Treatment))
+```
+
+```{r limma_fit, fig.align="center", echo=FALSE, fig.width=10, fig.height=6, dpi=300, dev="png"}
+fit_proteome <- lmFit(proteome_Elist_centered$E, design)
+cat("Average expression summary:\n")
+print(summary(fit_proteome$Amean))
+```
+
+```{r limma_contrasts}
+# Single contrast: NRG1 vs Scramble
+contrast_matrix <- makeContrasts(
+  NRG1_vs_Scramble = NRG1 - Scramble,
+  levels = design
+)
+
+cat("Contrast matrix:\n")
+print(contrast_matrix)
+```
+
+```{r fitting_contrasts_ebayes}
+fit_proteome <- contrasts.fit(fit_proteome, contrast_matrix)
+fit_proteome <- eBayes(fit_proteome, trend = TRUE)
+```
+
+```{r limma_variance_plot, fig.align="center", echo=FALSE, fig.width=10, fig.height=6, dpi=300, dev="png"}
+plotSA(fit_proteome, main = "Mean-Variance Trend - NRG1 vs Scramble Proteome")
+```
+
+```{r limma_results}
+# Get differential expression results
+DT_proteome <- decideTests(fit_proteome, p.value = 0.05, adjust.method = "BH")
+cat("Summary of differential expression:\n")
+print(summary(DT_proteome))
+
+# Get top table results
+tt_proteome <- topTable(fit_proteome, coef = "NRG1_vs_Scramble", n = Inf, sort.by = "P")
+
+# Count significant proteins
+sig_proteins <- sum(tt_proteome$adj.P.Val < 0.05, na.rm = TRUE)
+cat("\nSignificant proteins (FDR < 0.05):", sig_proteins, "\n")
+```
+
+```{r de_proteins_function}
+output_dir <- "results/differential"
+
+extract_and_save_results <- function(fit, contrast_name, elist, output_dir) {
+  # Extract statistical results
+  results <- topTable(fit, coef = contrast_name, number = Inf, sort.by = "P")
+  
+  # Save original rownames as Gene.names column
+  results$Gene.names <- rownames(results)
+  
+  # Add annotation columns
+  if(!is.null(elist$genes) && nrow(elist$genes) > 0) {
+    for(col in colnames(elist$genes)) {
+      if(col %in% colnames(results)) next
+      results[[col]] <- NA
+    }
+    
+    common_ids <- intersect(rownames(results), rownames(elist$genes))
+    
+    if(length(common_ids) > 0) {
+      for(col in colnames(elist$genes)) {
+        if(!(col %in% colnames(results))) next
+        results[common_ids, col] <- elist$genes[common_ids, col]
+      }
+    }
+  }
+  
+  # Add classification columns
+  results$Significant <- ifelse(results$adj.P.Val < 0.05, "FDR < 0.05", "Not Significant")
+  results$Effect_Size <- ifelse(abs(results$logFC) > 1, "Large Effect (|logFC| > 1)", "Small Effect")
+  results$Category <- paste(results$Significant, results$Effect_Size, sep = " & ")
+  
+  # Save to file
+  filename <- file.path(output_dir, paste0(contrast_name, "_results.csv"))
+  write.csv(results, filename, row.names = FALSE)
+  
+  cat(sprintf("Saved %s: %d features, %d significant (FDR < 0.05)\n", 
+              contrast_name, nrow(results), sum(results$adj.P.Val < 0.05)))
+  
+  return(results)
+}
+
+# Extract results
+all_results <- extract_and_save_results(
+  fit = fit_proteome, 
+  contrast_name = "NRG1_vs_Scramble",
+  elist = proteome_Elist_centered,
+  output_dir = output_dir
+)
+```
+
+```{r volcano_plot_function}
+regulation_colors <- c(
+  "Upregulated" = "#14767F",      # RENEW Teal  
+  "Downregulated" = "#D55E00",    # Oxygenated Red
+  "Significant" = "#CC79A7",      # Cool Purple (significant but low FC)
+  "Not Significant" = "#999999"   # Slate Grey
+)
+
+create_volcano_plot <- function(fit, contrast_name, elist, 
+                                fdr_threshold = 0.05, 
+                                fc_cutoff = 1,
+                                n_label = 10) {
+  
+  # Extract results
+  results <- topTable(fit, coef = contrast_name, number = Inf, sort.by = "none")
+  
+  # Get gene names from elist annotation using rownames for matching
+  # Use drop=TRUE to ensure we get a vector, not a matrix/data.frame
+  if(!is.null(rownames(elist$genes))) {
+    results$Gene <- as.character(elist$genes[rownames(results), "Gene.names", drop = TRUE])
+  } else {
+    # Fallback: try to extract from rownames (format: GeneName_UniprotID)
+    results$Gene <- sub("_[^_]+$", "", rownames(results))
+  }
+  
+  # For proteins without gene names, use UniprotID as fallback
+  missing_genes <- is.na(results$Gene) | results$Gene == "" | results$Gene == "NA"
+  if(any(missing_genes)) {
+    results$Gene[missing_genes] <- sub(".*_", "", rownames(results)[missing_genes])
+  }
+  
+  # Classify proteins
+  results$Regulation <- "Not Significant"
+  results$Regulation[results$adj.P.Val < fdr_threshold] <- "Significant"
+  results$Regulation[results$adj.P.Val < fdr_threshold & results$logFC > fc_cutoff] <- "Upregulated"
+  results$Regulation[results$adj.P.Val < fdr_threshold & results$logFC < -fc_cutoff] <- "Downregulated"
+  results$Regulation <- factor(results$Regulation, 
+                               levels = c("Upregulated", "Downregulated", "Significant", "Not Significant"))
+  
+  # Count
+  n_up <- sum(results$Regulation == "Upregulated")
+  n_down <- sum(results$Regulation == "Downregulated")
+  n_sig <- sum(results$Regulation == "Significant")
+  
+  # Select top genes to label
+  results$Label <- ""
+  
+  # Top upregulated
+  up_genes <- results[results$Regulation == "Upregulated", ]
+  if(nrow(up_genes) > 0) {
+    up_genes <- up_genes[order(-up_genes$logFC), ]
+    n_up_label <- min(n_label, nrow(up_genes))
+    results$Label[rownames(results) %in% rownames(up_genes)[1:n_up_label]] <- 
+      results$Gene[rownames(results) %in% rownames(up_genes)[1:n_up_label]]
+  }
+  
+  # Top downregulated
+  down_genes <- results[results$Regulation == "Downregulated", ]
+  if(nrow(down_genes) > 0) {
+    down_genes <- down_genes[order(down_genes$logFC), ]
+    n_down_label <- min(n_label, nrow(down_genes))
+    results$Label[rownames(results) %in% rownames(down_genes)[1:n_down_label]] <- 
+      results$Gene[rownames(results) %in% rownames(down_genes)[1:n_down_label]]
+  }
+  
+  # Create volcano plot
+  p <- ggplot(results, aes(x = logFC, y = -log10(adj.P.Val), color = Regulation)) +
+    geom_point(alpha = 0.4, size = 2) +
+    geom_text_repel(aes(label = Label), 
+                   size = 4, 
+                   max.overlaps = 20,
+                   box.padding = 0.5,
+                   point.padding = 0.5,
+                   segment.color = "grey50",
+                   segment.size = 0.5,
+                   min.segment.length = 0,
+                   show.legend = FALSE) +
+    scale_color_manual(values = regulation_colors) +
+    geom_hline(yintercept = -log10(fdr_threshold), linetype = "dashed", color = "black", linewidth = 0.8) +
+    geom_vline(xintercept = c(-fc_cutoff, fc_cutoff), linetype = "dashed", color = "black", linewidth = 0.8) +
+    labs(
+      title = paste0("Volcano Plot: ", contrast_name),
+      subtitle = paste0("Up: ", n_up, " | Down: ", n_down, " | Sig (low FC): ", n_sig),
+      x = "log2 Fold Change",
+      y = "-log10(FDR)",
+      color = "Regulation"
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+      plot.subtitle = element_text(hjust = 0.5, size = 14),
+      axis.title = element_text(size = 16),
+      axis.text = element_text(size = 12),
+      legend.position = "right",
+      legend.title = element_text(size = 14),
+      legend.text = element_text(size = 12)
+    )
+  
+  return(p)
+}
+```
+
+```{r proteome_volcano, warnings=FALSE, fig.align="center", echo=FALSE, fig.width=12, fig.height=8, dpi=300, dev="png"}
+p <- create_volcano_plot(
+  fit = fit_proteome,
+  contrast_name = "NRG1_vs_Scramble",
+  elist = proteome_Elist_centered,
+  fdr_threshold = 0.05,
+  fc_cutoff = 1,
+  n_label = 15
+)
+
+print(p)
+ggsave("results/volcano/NRG1_vs_Scramble_volcano_FDR.svg", plot = p, width = 12, height = 8, device = "svg")
+ggsave("results/volcano/NRG1_vs_Scramble_volcano_FDR.jpeg", plot = p, width = 12, height = 8, device = "jpeg", dpi = 300)
+```
+
+```{r volcano_plot_pvalue_function}
+# Volcano plot function using p-value instead of FDR
+create_volcano_plot_pvalue <- function(fit, contrast_name, elist, 
+                                       pval_threshold = 0.05, 
+                                       fc_cutoff = 1,
+                                       n_label = 10) {
+  
+  # Extract results
+  results <- topTable(fit, coef = contrast_name, number = Inf, sort.by = "none")
+  
+  # Get gene names from elist annotation using rownames for matching
+  if(!is.null(rownames(elist$genes))) {
+    results$Gene <- as.character(elist$genes[rownames(results), "Gene.names", drop = TRUE])
+  } else {
+    results$Gene <- sub("_[^_]+$", "", rownames(results))
+  }
+  
+  # For proteins without gene names, use UniprotID as fallback
+  missing_genes <- is.na(results$Gene) | results$Gene == "" | results$Gene == "NA"
+  if(any(missing_genes)) {
+    results$Gene[missing_genes] <- sub(".*_", "", rownames(results)[missing_genes])
+  }
+  
+  # Classify proteins using P.Value instead of adj.P.Val
+  results$Regulation <- "Not Significant"
+  results$Regulation[results$P.Value < pval_threshold] <- "Significant"
+  results$Regulation[results$P.Value < pval_threshold & results$logFC > fc_cutoff] <- "Upregulated"
+  results$Regulation[results$P.Value < pval_threshold & results$logFC < -fc_cutoff] <- "Downregulated"
+  results$Regulation <- factor(results$Regulation, 
+                               levels = c("Upregulated", "Downregulated", "Significant", "Not Significant"))
+  
+  # Count
+  n_up <- sum(results$Regulation == "Upregulated")
+  n_down <- sum(results$Regulation == "Downregulated")
+  n_sig <- sum(results$Regulation == "Significant")
+  
+  # Select top genes to label
+  results$Label <- ""
+  
+  # Top upregulated
+  up_genes <- results[results$Regulation == "Upregulated", ]
+  if(nrow(up_genes) > 0) {
+    up_genes <- up_genes[order(-up_genes$logFC), ]
+    n_up_label <- min(n_label, nrow(up_genes))
+    results$Label[rownames(results) %in% rownames(up_genes)[1:n_up_label]] <- 
+      results$Gene[rownames(results) %in% rownames(up_genes)[1:n_up_label]]
+  }
+  
+  # Top downregulated
+  down_genes <- results[results$Regulation == "Downregulated", ]
+  if(nrow(down_genes) > 0) {
+    down_genes <- down_genes[order(down_genes$logFC), ]
+    n_down_label <- min(n_label, nrow(down_genes))
+    results$Label[rownames(results) %in% rownames(down_genes)[1:n_down_label]] <- 
+      results$Gene[rownames(results) %in% rownames(down_genes)[1:n_down_label]]
+  }
+  
+  # Create volcano plot
+  p <- ggplot(results, aes(x = logFC, y = -log10(P.Value), color = Regulation)) +
+    geom_point(alpha = 0.4, size = 2) +
+    geom_text_repel(aes(label = Label), 
+                   size = 4, 
+                   max.overlaps = 20,
+                   box.padding = 0.5,
+                   point.padding = 0.5,
+                   segment.color = "grey50",
+                   segment.size = 0.5,
+                   min.segment.length = 0,
+                   show.legend = FALSE) +
+    scale_color_manual(values = regulation_colors) +
+    geom_hline(yintercept = -log10(pval_threshold), linetype = "dashed", color = "black", linewidth = 0.8) +
+    geom_vline(xintercept = c(-fc_cutoff, fc_cutoff), linetype = "dashed", color = "black", linewidth = 0.8) +
+    labs(
+      title = paste0("Volcano Plot (p-value): ", contrast_name),
+      subtitle = paste0("Up: ", n_up, " | Down: ", n_down, " | Sig (low FC): ", n_sig),
+      x = "log2 Fold Change",
+      y = "-log10(p-value)",
+      color = "Regulation"
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+      plot.subtitle = element_text(hjust = 0.5, size = 14),
+      axis.title = element_text(size = 16),
+      axis.text = element_text(size = 12),
+      legend.position = "right",
+      legend.title = element_text(size = 14),
+      legend.text = element_text(size = 12)
+    )
+  
+  return(p)
+}
+```
+
+```{r proteome_volcano_pvalue, warnings=FALSE, fig.align="center", echo=FALSE, fig.width=12, fig.height=8, dpi=300, dev="png"}
+p_pval <- create_volcano_plot_pvalue(
+  fit = fit_proteome,
+  contrast_name = "NRG1_vs_Scramble",
+  elist = proteome_Elist_centered,
+  pval_threshold = 0.05,
+  fc_cutoff = 1,
+  n_label = 15
+)
+
+print(p_pval)
+ggsave("results/volcano/NRG1_vs_Scramble_volcano_pvalue.svg", plot = p_pval, width = 12, height = 8, device = "svg")
+ggsave("results/volcano/NRG1_vs_Scramble_volcano_pvalue.jpeg", plot = p_pval, width = 12, height = 8, device = "jpeg", dpi = 300)
+```
+
+### Heatmap of Significant Proteins
+
+```{r proteome_heatmap, fig.align="center", echo=FALSE, fig.width=10, fig.height=10, dpi=300, dev="png"}
+# Extract significant proteins
+sig_proteins_df <- all_results[all_results$adj.P.Val < 0.05, ]
+
+if(nrow(sig_proteins_df) > 0) {
+  # Get expression data for significant proteins
+  sig_features <- rownames(sig_proteins_df)
+  sig_rows <- rownames(proteome_Elist_centered$E) %in% sig_features
+  sig_data <- proteome_Elist_centered$E[sig_rows, ]
+  
+  # Convert to matrix
+  if(is.data.frame(sig_data)) {
+    sig_data <- as.matrix(sig_data)
+  }
+  
+  # Clean data
+  sig_data[!is.finite(sig_data)] <- NA
+  sig_data <- na.omit(sig_data)
+  
+  if(nrow(sig_data) > 1) {
+    # Scale data row-wise
+    sig_data_scaled <- t(scale(t(sig_data)))
+    sig_data_scaled[sig_data_scaled > 3] <- 3
+    sig_data_scaled[sig_data_scaled < -3] <- -3
+    
+    # Annotation
+    HManno_col <- data.frame(
+      Treatment = targets$Treatment[match(colnames(sig_data_scaled), targets$Sample)]
+    )
+    rownames(HManno_col) <- colnames(sig_data_scaled)
+    
+    HManno_colors <- list(
+      Treatment = treatment_colors
+    )
+    
+    # Palette
+    heatmap_palette <- colorRampPalette(c(
+      "#301934",    # Very dark purple
+      "#882255",    # Deep burgundy
+      "#8B4F9F",    # Medium purple
+      "#F1C232",    # Light gold
+      "#F0E68C"     # Khaki
+    ))(100)
+    
+    # Generate heatmap and save
+    pheatmap(sig_data_scaled, 
+             scale = "none",  
+             show_rownames = nrow(sig_data_scaled) <= 50,
+             annotation_col = HManno_col,
+             annotation_colors = HManno_colors,
+             color = heatmap_palette,
+             cluster_cols = TRUE,
+             clustering_distance_rows = "correlation",
+             clustering_method = "complete",
+             fontsize = 10,
+             fontsize_row = 8,
+             border_color = NA,
+             main = paste0("Significant Proteins (FDR < 0.05): n = ", nrow(sig_data_scaled)),
+             filename = "results/differential/Significant_Proteins_Heatmap.svg",
+             width = 10, height = 10)
+    
+    pheatmap(sig_data_scaled, 
+             scale = "none",  
+             show_rownames = nrow(sig_data_scaled) <= 50,
+             annotation_col = HManno_col,
+             annotation_colors = HManno_colors,
+             color = heatmap_palette,
+             cluster_cols = TRUE,
+             clustering_distance_rows = "correlation",
+             clustering_method = "complete",
+             fontsize = 10,
+             fontsize_row = 8,
+             border_color = NA,
+             main = paste0("Significant Proteins (FDR < 0.05): n = ", nrow(sig_data_scaled)),
+             filename = "results/differential/Significant_Proteins_Heatmap.jpeg",
+             width = 10, height = 10)
+    
+    # Display in notebook
+    pheatmap(sig_data_scaled, 
+             scale = "none",  
+             show_rownames = nrow(sig_data_scaled) <= 50,
+             annotation_col = HManno_col,
+             annotation_colors = HManno_colors,
+             color = heatmap_palette,
+             cluster_cols = TRUE,
+             clustering_distance_rows = "correlation",
+             clustering_method = "complete",
+             fontsize = 10,
+             fontsize_row = 8,
+             border_color = NA,
+             main = paste0("Significant Proteins (FDR < 0.05): n = ", nrow(sig_data_scaled)))
+  } else {
+    cat("Not enough significant proteins for heatmap\n")
+  }
+} else {
+  cat("No significant proteins found at FDR < 0.05\n")
+}
+```
+
+### Heatmap of Top Differentially Expressed Proteins
+
+```{r top_de_heatmap, fig.align="center", echo=FALSE, fig.width=12, fig.height=10, dpi=300, dev="png"}
+# Select top N upregulated and downregulated proteins
+n_top <- 25  # Number of top proteins per direction
+
+# Get top upregulated (highest logFC with significant p-value)
+top_up <- all_results %>%
+  filter(P.Value < 0.05, logFC > 0) %>%
+  arrange(desc(logFC)) %>%
+  head(n_top)
+
+# Get top downregulated (lowest logFC with significant p-value)
+top_down <- all_results %>%
+  filter(P.Value < 0.05, logFC < 0) %>%
+  arrange(logFC) %>%
+  head(n_top)
+
+# Combine
+top_de <- rbind(top_up, top_down)
+
+if(nrow(top_de) > 1) {
+  # Get expression data
+  top_features <- rownames(top_de)
+  top_rows <- rownames(proteome_Elist_centered$E) %in% top_features
+  top_data <- proteome_Elist_centered$E[top_rows, ]
+  
+  # Convert to matrix
+  if(is.data.frame(top_data)) {
+    top_data <- as.matrix(top_data)
+  }
+  
+  # Clean data
+  top_data[!is.finite(top_data)] <- NA
+  top_data <- na.omit(top_data)
+  
+  if(nrow(top_data) > 1) {
+    # Scale data row-wise
+    top_data_scaled <- t(scale(t(top_data)))
+    top_data_scaled[top_data_scaled > 3] <- 3
+    top_data_scaled[top_data_scaled < -3] <- -3
+    
+    # Get gene names for row labels
+    row_genes <- proteome_Elist_centered$genes[rownames(top_data_scaled), "Gene.names", drop = TRUE]
+    row_genes[is.na(row_genes) | row_genes == ""] <- sub(".*_", "", rownames(top_data_scaled)[is.na(row_genes) | row_genes == ""])
+    rownames(top_data_scaled) <- row_genes
+    
+    # Create row annotation for regulation direction
+    row_anno <- data.frame(
+      Regulation = ifelse(rownames(top_data) %in% rownames(top_up), "Upregulated", "Downregulated")
+    )
+    rownames(row_anno) <- row_genes
+    
+    # Annotation
+    HManno_col <- data.frame(
+      Treatment = targets$Treatment[match(colnames(top_data_scaled), targets$Sample)]
+    )
+    rownames(HManno_col) <- colnames(top_data_scaled)
+    
+    HManno_colors <- list(
+      Treatment = treatment_colors,
+      Regulation = c("Upregulated" = "#14767F", "Downregulated" = "#D55E00")
+    )
+    
+    # Palette
+    heatmap_palette <- colorRampPalette(c(
+      "#301934",    # Very dark purple
+      "#882255",    # Deep burgundy
+      "#8B4F9F",    # Medium purple
+      "#F1C232",    # Light gold
+      "#F0E68C"     # Khaki
+    ))(100)
+    
+    # Save heatmaps
+    pheatmap(top_data_scaled, 
+             scale = "none",  
+             show_rownames = TRUE,
+             annotation_col = HManno_col,
+             annotation_row = row_anno,
+             annotation_colors = HManno_colors,
+             color = heatmap_palette,
+             cluster_cols = TRUE,
+             cluster_rows = FALSE,  # Keep up/down grouped
+             fontsize = 10,
+             fontsize_row = 8,
+             border_color = NA,
+             main = paste0("Top ", n_top, " Up/Downregulated Proteins (p < 0.05)"),
+             filename = "results/differential/Top_DE_Proteins_Heatmap.svg",
+             width = 12, height = 10)
+    
+    pheatmap(top_data_scaled, 
+             scale = "none",  
+             show_rownames = TRUE,
+             annotation_col = HManno_col,
+             annotation_row = row_anno,
+             annotation_colors = HManno_colors,
+             color = heatmap_palette,
+             cluster_cols = TRUE,
+             cluster_rows = FALSE,
+             fontsize = 10,
+             fontsize_row = 8,
+             border_color = NA,
+             main = paste0("Top ", n_top, " Up/Downregulated Proteins (p < 0.05)"),
+             filename = "results/differential/Top_DE_Proteins_Heatmap.jpeg",
+             width = 12, height = 10)
+    
+    # Display in notebook
+    pheatmap(top_data_scaled, 
+             scale = "none",  
+             show_rownames = TRUE,
+             annotation_col = HManno_col,
+             annotation_row = row_anno,
+             annotation_colors = HManno_colors,
+             color = heatmap_palette,
+             cluster_cols = TRUE,
+             cluster_rows = FALSE,
+             fontsize = 10,
+             fontsize_row = 8,
+             border_color = NA,
+             main = paste0("Top ", n_top, " Up/Downregulated Proteins (p < 0.05)"))
+  } else {
+    cat("Not enough proteins for top DE heatmap\n")
+  }
+} else {
+  cat("Not enough differentially expressed proteins for heatmap\n")
+}
+```
+
+### Gene Ontology Enrichment Analysis
+
+```{r go_enrichment, fig.align="center", fig.width=12, fig.height=10, dpi=300, dev="png"}
+# Get significant genes
+sig_up <- all_results$Gene.names[all_results$adj.P.Val < 0.05 & all_results$logFC > 0]
+sig_down <- all_results$Gene.names[all_results$adj.P.Val < 0.05 & all_results$logFC < 0]
+
+# Remove NA
+sig_up <- sig_up[!is.na(sig_up)]
+sig_down <- sig_down[!is.na(sig_down)]
+
+cat("Upregulated genes:", length(sig_up), "\n")
+cat("Downregulated genes:", length(sig_down), "\n")
+
+# Run enrichment if enough genes
+if(length(sig_up) >= 5) {
+  cat("\n--- Upregulated GO Enrichment ---\n")
+  ego_up <- enrichGO(gene = sig_up,
+                     OrgDb = org.Hs.eg.db,
+                     keyType = "SYMBOL",
+                     ont = "BP",
+                     pAdjustMethod = "BH",
+                     pvalueCutoff = 0.05)
+  
+  if(!is.null(ego_up) && nrow(ego_up@result) > 0) {
+    print(dotplot(ego_up, showCategory = 15, title = "GO BP - Upregulated in NRG1"))
+  }
+}
+
+if(length(sig_down) >= 5) {
+  cat("\n--- Downregulated GO Enrichment ---\n")
+  ego_down <- enrichGO(gene = sig_down,
+                       OrgDb = org.Hs.eg.db,
+                       keyType = "SYMBOL",
+                       ont = "BP",
+                       pAdjustMethod = "BH",
+                       pvalueCutoff = 0.05)
+  
+  if(!is.null(ego_down) && nrow(ego_down@result) > 0) {
+    print(dotplot(ego_down, showCategory = 15, title = "GO BP - Downregulated in NRG1"))
+  }
+}
+```
+
+### Summary Statistics
+
+```{r summary_stats}
+cat("=== Analysis Summary ===\n\n")
+cat("Input data:\n")
+cat("  - Total proteins in dataset:", nrow(proteomics_data), "\n")
+cat("  - Proteins after filtering:", nrow(proteome_Elist_centered$E), "\n")
+
+cat("\nDifferential expression (NRG1 vs Scramble):\n")
+cat("  - Upregulated (FDR < 0.05, logFC > 1):", sum(all_results$adj.P.Val < 0.05 & all_results$logFC > 1), "\n")
+cat("  - Downregulated (FDR < 0.05, logFC < -1):", sum(all_results$adj.P.Val < 0.05 & all_results$logFC < -1), "\n")
+cat("  - Significant (FDR < 0.05, any FC):", sum(all_results$adj.P.Val < 0.05), "\n")
+
+cat("\nTop 10 upregulated proteins:\n")
+top_up <- head(all_results[order(-all_results$logFC), c("Gene.names", "logFC", "adj.P.Val")], 10)
+print(top_up)
+
+cat("\nTop 10 downregulated proteins:\n")
+top_down <- head(all_results[order(all_results$logFC), c("Gene.names", "logFC", "adj.P.Val")], 10)
+print(top_down)
+```
+
+### Session Info
+
+```{r session_info}
+sessionInfo()
+```
+
+
+
+```{r go_enrichment, fig.align="center", fig.width=12, fig.height=10, dpi=300, dev="png"}
+library(dplyr)
+library(pheatmap)
+
+n_top <- 25
+
+top_up <- all_results %>%
+  filter(P.Value < 0.05, logFC > 0) %>%
+  arrange(desc(logFC)) %>%
+  head(n_top)
+
+top_down <- all_results %>%
+  filter(P.Value < 0.05, logFC < 0) %>%
+  arrange(logFC) %>%
+  head(n_top)
+
+top_de <- rbind(top_up, top_down)
+
+expr_matrix <- proteome_Elist_centered$E
+if(is.null(rownames(expr_matrix))) {
+  rownames(expr_matrix) <- rownames(proteome_Elist_centered$genes)
+}
+
+top_data <- expr_matrix[top_de$gene_protein, , drop = FALSE]
+top_data <- na.omit(top_data)
+
+top_data_scaled <- t(scale(t(top_data)))
+top_data_scaled[top_data_scaled > 3] <- 3
+top_data_scaled[top_data_scaled < -3] <- -3
+
+# Get gene names and replace NA/empty with UniprotID
+gene_names <- top_de$Gene.names[match(rownames(top_data_scaled), top_de$gene_protein)]
+missing <- is.na(gene_names) | gene_names == ""
+gene_names[missing] <- sub(".*_", "", rownames(top_data_scaled)[missing])
+
+# Make unique if there are duplicates
+gene_names <- make.unique(gene_names)
+
+row_anno <- data.frame(Regulation = ifelse(rownames(top_data_scaled) %in% top_up$gene_protein, "Upregulated", "Downregulated"))
+rownames(row_anno) <- gene_names
+rownames(top_data_scaled) <- gene_names
+
+HManno_col <- data.frame(Treatment = targets$Treatment[match(colnames(top_data_scaled), targets$Sample)])
+rownames(HManno_col) <- colnames(top_data_scaled)
+
+pheatmap(top_data_scaled, 
+         annotation_col = HManno_col,
+         annotation_row = row_anno,
+         annotation_colors = list(Treatment = treatment_colors, Regulation = c("Upregulated" = "#14767F", "Downregulated" = "#D55E00")),
+         color = colorRampPalette(c("#301934", "#882255", "#8B4F9F", "#F1C232", "#F0E68C"))(100),
+         cluster_rows = FALSE,
+         show_rownames = TRUE,
+         main = "Top 25 Up/Downregulated Proteins (p < 0.05)")
+
+```
