@@ -1226,127 +1226,17 @@ top_down <- head(all_results[order(all_results$logFC), c("Gene.names", "logFC", 
 print(top_down)
 ```
 
-## Heatmap top genes
+### ERBB Analysis
 
-```{r heatmap_enrichment, fig.align="center", fig.width=12, fig.height=10, dpi=300, dev="png"}
-library(dplyr)
-library(pheatmap)
-
-n_top <- 25
-
-top_up <- all_results %>%
-  filter(P.Value < 0.05, logFC > 0) %>%
-  arrange(desc(logFC)) %>%
-  head(n_top)
-
-top_down <- all_results %>%
-  filter(P.Value < 0.05, logFC < 0) %>%
-  arrange(logFC) %>%
-  head(n_top)
-
-top_de <- rbind(top_up, top_down)
-
-expr_matrix <- proteome_Elist_centered$E
-if(is.null(rownames(expr_matrix))) {
-  rownames(expr_matrix) <- rownames(proteome_Elist_centered$genes)
-}
-
-top_data <- expr_matrix[top_de$gene_protein, , drop = FALSE]
-top_data <- na.omit(top_data)
-
-top_data_scaled <- t(scale(t(top_data)))
-top_data_scaled[top_data_scaled > 3] <- 3
-top_data_scaled[top_data_scaled < -3] <- -3
-
-# Get gene names and replace NA/empty with UniprotID
-gene_names <- top_de$Gene.names[match(rownames(top_data_scaled), top_de$gene_protein)]
-missing <- is.na(gene_names) | gene_names == ""
-gene_names[missing] <- sub(".*_", "", rownames(top_data_scaled)[missing])
-
-# Make unique if there are duplicates
-gene_names <- make.unique(gene_names)
-
-row_anno <- data.frame(Regulation = ifelse(rownames(top_data_scaled) %in% top_up$gene_protein, "Upregulated", "Downregulated"))
-rownames(row_anno) <- gene_names
-rownames(top_data_scaled) <- gene_names
-
-HManno_col <- data.frame(Treatment = targets$Treatment[match(colnames(top_data_scaled), targets$Sample)])
-rownames(HManno_col) <- colnames(top_data_scaled)
-
-pheatmap(top_data_scaled, 
-         annotation_col = HManno_col,
-         annotation_row = row_anno,
-         annotation_colors = list(Treatment = treatment_colors, Regulation = c("Upregulated" = "#14767F", "Downregulated" = "#D55E00")),
-         color = colorRampPalette(c("#301934", "#882255", "#8B4F9F", "#F1C232", "#F0E68C"))(100),
-         cluster_rows = FALSE,
-         show_rownames = TRUE,
-         main = "Top 25 Up/Downregulated Proteins (p < 0.05)")
-
-# Create the heatmap object
-ht <- pheatmap(top_data_scaled, 
-               annotation_col = HManno_col,
-               annotation_row = row_anno,
-               annotation_colors = list(Treatment = treatment_colors, Regulation = c("Upregulated" = "#14767F", "Downregulated" = "#D55E00")),
-               color = colorRampPalette(c("#301934", "#882255", "#8B4F9F", "#F1C232", "#F0E68C"))(100),
-               cluster_rows = FALSE,
-               show_rownames = TRUE,
-               main = "Top 25 Up/Downregulated Proteins (p < 0.05)")
-
-# Force use of original pheatmap package (not ComplexHeatmap wrapper)
-pheatmap::pheatmap(top_data_scaled, 
-         annotation_col = HManno_col,
-         annotation_row = row_anno,
-         annotation_colors = list(Treatment = treatment_colors, Regulation = c("Upregulated" = "#14767F", "Downregulated" = "#D55E00")),
-         color = colorRampPalette(c("#301934", "#882255", "#8B4F9F", "#F1C232", "#F0E68C"))(100),
-         cluster_rows = FALSE,
-         show_rownames = TRUE,
-         main = "Top 25 Up/Downregulated Proteins (p < 0.05)",
-         filename = "results_24h/heatmap/Top_DE_Proteins_Heatmap.png",
-         width = 10,
-         height = 12)
-
-# Force use of original pheatmap package (not ComplexHeatmap wrapper)
-pheatmap::pheatmap(top_data_scaled, 
-         annotation_col = HManno_col,
-         annotation_row = row_anno,
-         annotation_colors = list(Treatment = treatment_colors, Regulation = c("Upregulated" = "#14767F", "Downregulated" = "#D55E00")),
-         color = colorRampPalette(c("#301934", "#882255", "#8B4F9F", "#F1C232", "#F0E68C"))(100),
-         cluster_rows = FALSE,
-         show_rownames = TRUE,
-         main = "Top 25 Up/Downregulated Proteins (p < 0.05)",
-         filename = "results_24h/heatmap/Top_DE_Proteins_Heatmap.pdf",
-         width = 10,
-         height = 12)
-
-# Check files
-list.files("results_24h/heatmap/")
-
-# Display in notebook
-pheatmap(top_data_scaled, 
-         annotation_col = HManno_col,
-         annotation_row = row_anno,
-         annotation_colors = list(Treatment = treatment_colors, Regulation = c("Upregulated" = "#14767F", "Downregulated" = "#D55E00")),
-         color = colorRampPalette(c("#301934", "#882255", "#8B4F9F", "#F1C232", "#F0E68C"))(100),
-         cluster_rows = FALSE,
-         show_rownames = TRUE,
-         main = "Top 25 Up/Downregulated Proteins (p < 0.05)")
-
-
-```
-
-## ERBB enrichment
-
-```{r ERRB_enrichment, fig.align="center", fig.width=12, fig.height=10, dpi=300, dev="png"}
-
-dir.create("results_24h/differential", recursive = TRUE, showWarnings = FALSE)
+```{r ERBB}
+dir.create("results/differential", recursive = TRUE, showWarnings = FALSE)
 
 
 library(dplyr)
 library(ggplot2)
 
-# ERBB Signaling Pathway genes (KEGG hsa04012)
 erbb_genes <- c(
-  # Receptors
+# Receptors
   "EGFR", "ERBB2", "ERBB3", "ERBB4",
   # Ligands
   "EGF", "TGFA", "AREG", "BTC", "EREG", "HBEGF", "NRG1", "NRG2", "NRG3", "NRG4",
@@ -1409,8 +1299,7 @@ if(nrow(erbb_results) > 0) {
   if(nrow(erbb_results_unique) > 0) {
     
     # Order by logFC
-    erbb_results_unique$Gene.names <- factor(erbb_results_unique$Gene.names, 
-                                             levels = erbb_results_unique$Gene.names)
+    erbb_results_unique$Gene.names <- factor(erbb_results_unique$Gene.names,    levels = erbb_results_unique$Gene.names)
     
     p_erbb <- ggplot(erbb_results_unique, aes(x = logFC, y = Gene.names)) +
       geom_point(aes(size = -log10(P.Value), color = logFC)) +
@@ -1435,8 +1324,8 @@ if(nrow(erbb_results) > 0) {
     print(p_erbb)
     
     # Save
-    ggsave("results_24h/differential/ERBB_pathway_dotplot.svg", plot = p_erbb, width = 10, height = max(6, nrow(erbb_results_unique) * 0.3), device = "svg")
-    ggsave("results_24h/differential/ERBB_pathway_dotplot.jpeg", plot = p_erbb, width = 10, height = max(6, nrow(erbb_results_unique) * 0.3), device = "jpeg", dpi = 300)
+    ggsave("results/differential/ERBB_pathway_dotplot.svg", plot = p_erbb, width = 10, height = max(6, nrow(erbb_results_unique) * 0.3), device = "svg")
+    ggsave("results/differential/ERBB_pathway_dotplot.jpeg", plot = p_erbb, width = 10, height = max(6, nrow(erbb_results_unique) * 0.3), device = "jpeg", dpi = 300)
     
   } else {
     cat("No significant ERBB pathway genes found (p <= 0.05)\n")
@@ -1500,8 +1389,8 @@ if(nrow(erbb_results) > 0) {
     print(p_erbb)
     
     # Save
-    ggsave("results_24h/differential/ERBB_pathway_dotplot.svg", plot = p_erbb, width = 6, height = max(6, nrow(erbb_results_unique) * 0.3), device = "svg")
-    ggsave("results_24h/differential/ERBB_pathway_dotplot.jpeg", plot = p_erbb, width = 6, height = max(6, nrow(erbb_results_unique) * 0.3), device = "jpeg", dpi = 300)
+    ggsave("results/differential/ERBB_pathway_dotplot.svg", plot = p_erbb, width = 6, height = max(6, nrow(erbb_results_unique) * 0.3), device = "svg")
+    ggsave("results/differential/ERBB_pathway_dotplot.jpeg", plot = p_erbb, width = 6, height = max(6, nrow(erbb_results_unique) * 0.3), device = "jpeg", dpi = 300)
     
   } else {
     cat("No significant ERBB pathway genes found (p <= 0.05)\n")
@@ -1511,6 +1400,7 @@ if(nrow(erbb_results) > 0) {
   cat("No ERBB pathway genes found in results\n")
 }
 ```
+
 ### Session Info
 
 ```{r session_info}
