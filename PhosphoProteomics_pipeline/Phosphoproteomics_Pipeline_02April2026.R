@@ -10,7 +10,7 @@
 #   2.  Host protein normalization (subtract log2 protein from log2 phosphosite)
 #   3.  Kinase activity inference (KSEA, ULM, WMEAN) per contrast
 #   4.  TWO KSEA volcano styles per contrast:
-#       a) Original: scatter with size = n_substrates, labels on FDR < 0.05
+#       a) Canonical: scatter with size = n_substrates, labels on p < 0.05
 #       b) Compact: theme_void, top 3 labels, n= counts, ~2.35×2.43 inches
 #   5.  PCA & UMAP (global: by timepoint, by genotype)
 #   6.  Global heatmaps per timepoint (all FDR < 0.05 sites)
@@ -749,9 +749,9 @@ plot_ksea_barplot_canonical <- function(ksea_df, contrast_name, output_dir, top_
       kinase    = factor(kinase, levels = rev(kinase)),
       direction = ifelse(activity > 0, "Active", "Inactive"),
       sig_label = case_when(
-        fdr < 0.001 ~ "***",
-        fdr < 0.01  ~ "**",
-        fdr < 0.05  ~ "*",
+        p_value < 0.001 ~ "***",
+        p_value < 0.01  ~ "**",
+        p_value < 0.05  ~ "*",
         TRUE        ~ ""
       )
     )
@@ -772,7 +772,7 @@ plot_ksea_barplot_canonical <- function(ksea_df, contrast_name, output_dir, top_
     geom_vline(xintercept = 0, linewidth = 0.4, color = "grey30") +
     labs(
       title    = paste0("Kinase Activity (KSEA) — ", contrast_name),
-      subtitle = "OmniPath | * FDR<0.05  ** FDR<0.01  *** FDR<0.001",
+      subtitle = "OmniPath | * p<0.05  ** p<0.01  *** p<0.001",
       x        = "KSEA z-score",
       y        = NULL
     ) +
@@ -809,9 +809,9 @@ plot_ksea_barplot_compact <- function(ksea_df, contrast_name, output_dir, top_n 
       kinase    = factor(kinase, levels = rev(kinase)),
       direction = ifelse(activity > 0, "Active", "Inactive"),
       sig_label = case_when(
-        fdr < 0.001 ~ "***",
-        fdr < 0.01  ~ "**",
-        fdr < 0.05  ~ "*",
+        p_value < 0.001 ~ "***",
+        p_value < 0.01  ~ "**",
+        p_value < 0.05  ~ "*",
         TRUE        ~ ""
       )
     )
@@ -840,12 +840,12 @@ plot_ksea_volcano_original <- function(ksea_df, contrast_name, output_dir) {
   
   df <- ksea_df %>%
     mutate(
-      neg_log10_fdr = -log10(pmax(fdr, 1e-10)),
-      label         = ifelse(fdr < 0.05, kinase, ""),
-      direction     = ifelse(activity > 0, "Active", "Inactive")
+      neg_log10_p = -log10(pmax(p_value, 1e-10)),
+      label       = ifelse(p_value < 0.05, kinase, ""),
+      direction   = ifelse(activity > 0, "Active", "Inactive")
     )
   
-  p <- ggplot(df, aes(x = activity, y = neg_log10_fdr, color = direction, label = label)) +
+  p <- ggplot(df, aes(x = activity, y = neg_log10_p, color = direction, label = label)) +
     geom_point(aes(size = n_substrates), alpha = 0.7, stroke = 0) +
     geom_text_repel(size = 3, max.overlaps = 20, fontface = "bold",
                     segment.linewidth = 0.2) +
@@ -857,9 +857,9 @@ plot_ksea_volcano_original <- function(ksea_df, contrast_name, output_dir) {
     scale_size_continuous(range = c(2, 8), name = "n substrates") +
     labs(
       title    = paste0("KSEA Volcano — ", contrast_name),
-      subtitle = "Dashed line: FDR = 0.05",
+      subtitle = "Dashed line: p = 0.05",
       x        = "KSEA z-score (activity)",
-      y        = "-log10(FDR)",
+      y        = "-log10(p-value)",
       color    = NULL
     ) +
     theme_minimal(base_size = 11) +
@@ -945,9 +945,9 @@ plot_kinase_method_heatmap <- function(kinase_res, output_dir, top_n = 25) {
   method_cols <- grep("^activity_", colnames(combined), value = TRUE)
   if (length(method_cols) < 2) return(invisible(NULL))
   
-  # Select kinases: FDR < 0.05 or top N by |z-score|
+  # Select kinases: p < 0.05 or top N by |z-score|
   top_kinases <- ksea %>%
-    filter(fdr < 0.05) %>%
+    filter(p_value < 0.05) %>%
     arrange(desc(abs(activity))) %>%
     pull(kinase)
   
@@ -1102,6 +1102,237 @@ for (gene in names(DISEASE_LINES)) {
 }
 
 cat(sprintf("\n  ✓ Completed %d / 11 contrasts\n", length(disease_results)))
+
+# ==============================================================================
+# SECTION 10b: CROSS-CONTRAST KINASE VISUALIZATIONS
+# ==============================================================================
+
+cat("\n════════════════════════════════════════════════════════════════════════════════\n")
+cat("  CROSS-CONTRAST KINASE VISUALIZATIONS\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n")
+
+kinase_xdir <- file.path(OUTPUT_BASE, "Kinase_Cross_Contrast")
+if (!dir.exists(kinase_xdir)) dir.create(kinase_xdir, recursive = TRUE)
+
+# ---- Collect all KSEA results into one data frame ----
+all_ksea <- list()
+for (cn in names(kinase_results)) {
+  kr <- kinase_results[[cn]]
+  if (!is.null(kr) && !is.null(kr$ksea_results)) {
+    df <- kr$ksea_results
+    df$contrast  <- cn
+    df$genotype  <- sub("_D\\d+$", "", cn)
+    df$timepoint <- sub("^.*_(D\\d+)$", "\\1", cn)
+    all_ksea[[cn]] <- df
+  }
+}
+
+if (length(all_ksea) > 0) {
+  ksea_combined <- bind_rows(all_ksea)
+  cat(sprintf("  Collected KSEA results: %d kinases across %d contrasts\n",
+              length(unique(ksea_combined$kinase)), length(all_ksea)))
+  
+  # ---- 10b-A: KINASE ACTIVITY HEATMAP (z-score, all contrasts) ----
+  tryCatch({
+    cat("\n  Building kinase activity heatmap...\n")
+    
+    # Filter: kinases significant (p < 0.05) in at least 1 contrast
+    sig_kinases <- ksea_combined %>%
+      filter(p_value < 0.05) %>%
+      pull(kinase) %>%
+      unique()
+    
+    cat(sprintf("  Kinases significant in ≥1 contrast: %d\n", length(sig_kinases)))
+    
+    if (length(sig_kinases) >= 3) {
+      # Build z-score matrix
+      hm_df <- ksea_combined %>%
+        filter(kinase %in% sig_kinases) %>%
+        select(kinase, contrast, activity, p_value)
+      
+      # Pivot to matrix: kinase × contrast
+      zscore_wide <- hm_df %>%
+        select(kinase, contrast, activity) %>%
+        pivot_wider(names_from = contrast, values_from = activity) %>%
+        tibble::column_to_rownames("kinase")
+      
+      # Order columns: genotype × timepoint
+      contrast_order <- c()
+      for (gene in names(DISEASE_LINES)) {
+        for (tp in TIMEPOINTS) {
+          cn <- paste0(gene, "_", tp)
+          if (cn %in% colnames(zscore_wide)) contrast_order <- c(contrast_order, cn)
+        }
+      }
+      zscore_wide <- zscore_wide[, contrast_order, drop = FALSE]
+      zscore_mat <- as.matrix(zscore_wide)
+      
+      # Order rows by mean absolute z-score (most active at top)
+      row_order <- order(rowMeans(abs(zscore_mat), na.rm = TRUE), decreasing = TRUE)
+      zscore_mat <- zscore_mat[row_order, , drop = FALSE]
+      
+      # Significance overlay matrix (p-value based)
+      pval_wide <- hm_df %>%
+        select(kinase, contrast, p_value) %>%
+        pivot_wider(names_from = contrast, values_from = p_value) %>%
+        tibble::column_to_rownames("kinase")
+      pval_mat <- as.matrix(pval_wide[rownames(zscore_mat), contrast_order, drop = FALSE])
+      
+      # Star labels
+      star_mat <- matrix("", nrow = nrow(pval_mat), ncol = ncol(pval_mat))
+      star_mat[!is.na(pval_mat) & pval_mat < 0.05]  <- "*"
+      star_mat[!is.na(pval_mat) & pval_mat < 0.01]  <- "**"
+      star_mat[!is.na(pval_mat) & pval_mat < 0.001] <- "***"
+      
+      # Column annotation: Genotype + Timepoint
+      col_anno <- data.frame(
+        Genotype  = sub("_D\\d+$", "", contrast_order),
+        Timepoint = sub("^.*_(D\\d+)$", "\\1", contrast_order),
+        row.names = contrast_order
+      )
+      
+      anno_colors <- list(
+        Genotype  = c("TTN" = "#1b9e77", "DSP" = "#d95f02",
+                      "TNNT2" = "#7570b3", "TPM1" = "#e7298a"),
+        Timepoint = c("D15" = "#66c2a5", "D22" = "#fc8d62", "D29" = "#8da0cb")
+      )
+      
+      # Gaps between genotypes
+      geno_rle <- rle(col_anno$Genotype)
+      gaps_col <- cumsum(geno_rle$lengths[-length(geno_rle$lengths)])
+      
+      # Dynamic sizing
+      h <- min(49, max(6, nrow(zscore_mat) * 0.25 + 3))
+      w <- max(7, ncol(zscore_mat) * 0.6 + 4)
+      
+      # Symmetric color breaks
+      max_abs <- max(abs(zscore_mat), na.rm = TRUE)
+      breaks <- seq(-max_abs, max_abs, length.out = 101)
+      
+      png(file.path(kinase_xdir, "kinase_activity_heatmap_all_contrasts.png"),
+          width = w, height = h, units = "in", res = 300, bg = "transparent")
+      pheatmap(zscore_mat,
+               cluster_rows = TRUE, cluster_cols = FALSE,
+               show_rownames = TRUE, show_colnames = TRUE,
+               display_numbers = star_mat,
+               number_color = "black", fontsize_number = 7,
+               annotation_col = col_anno,
+               annotation_colors = anno_colors,
+               gaps_col = gaps_col,
+               color = colorRampPalette(c(COL_HEALTHY, "white", COL_DCM))(100),
+               breaks = breaks,
+               na_col = "grey90",
+               main = "Kinase Activity (KSEA z-score) — All Contrasts",
+               fontsize = 8, fontsize_row = 7, fontsize_col = 8)
+      dev.off()
+      
+      pdf(file.path(kinase_xdir, "kinase_activity_heatmap_all_contrasts.pdf"),
+          width = w, height = h)
+      pheatmap(zscore_mat,
+               cluster_rows = TRUE, cluster_cols = FALSE,
+               show_rownames = TRUE, show_colnames = TRUE,
+               display_numbers = star_mat,
+               number_color = "black", fontsize_number = 7,
+               annotation_col = col_anno,
+               annotation_colors = anno_colors,
+               gaps_col = gaps_col,
+               color = colorRampPalette(c(COL_HEALTHY, "white", COL_DCM))(100),
+               breaks = breaks,
+               na_col = "grey90",
+               main = "Kinase Activity (KSEA z-score) — All Contrasts",
+               fontsize = 8, fontsize_row = 7, fontsize_col = 8)
+      dev.off()
+      
+      # Export the matrix as CSV
+      write.csv(zscore_wide, file.path(kinase_xdir, "kinase_zscore_matrix.csv"))
+      
+      cat(sprintf("  ✓ Kinase heatmap: %d kinases × %d contrasts\n",
+                  nrow(zscore_mat), ncol(zscore_mat)))
+    } else {
+      cat("  ⚠ Fewer than 3 significant kinases — skipping heatmap\n")
+    }
+  }, error = function(e) cat(sprintf("  ⚠ Kinase heatmap failed: %s\n", e$message)))
+  
+  # ---- 10b-B: FACETED COMPACT VOLCANOS (4×3 grid) ----
+  tryCatch({
+    cat("\n  Building faceted KSEA volcano grid...\n")
+    
+    # Prepare combined data for plotting
+    plot_df <- ksea_combined %>%
+      mutate(
+        neg_log10_p = -log10(pmax(p_value, 1e-300)),
+        group = case_when(
+          p_value < 0.05 & z_score > 0 ~ "UP",
+          p_value < 0.05 & z_score < 0 ~ "DOWN",
+          TRUE ~ "NS"
+        ),
+        genotype  = factor(genotype, levels = names(DISEASE_LINES)),
+        timepoint = factor(timepoint, levels = TIMEPOINTS)
+      )
+    
+    # Top 3 labels per contrast per direction
+    top_labels <- plot_df %>%
+      filter(group != "NS") %>%
+      group_by(contrast, group) %>%
+      slice_min(order_by = p_value, n = 3, with_ties = FALSE) %>%
+      ungroup()
+    
+    # Count annotations per panel
+    count_df <- plot_df %>%
+      filter(group != "NS") %>%
+      group_by(genotype, timepoint, group) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      mutate(
+        x = ifelse(group == "UP",
+                   max(plot_df$z_score, na.rm = TRUE) * 0.75,
+                   min(plot_df$z_score, na.rm = TRUE) * 0.75),
+        y = max(plot_df$neg_log10_p, na.rm = TRUE) * 0.95,
+        color = ifelse(group == "UP", COL_DCM, COL_HEALTHY)
+      )
+    
+    p_grid <- ggplot(plot_df, aes(x = z_score, y = neg_log10_p)) +
+      geom_point(aes(color = group), alpha = 0.8, size = 1, stroke = 0) +
+      scale_color_manual(values = c("UP" = COL_DCM, "DOWN" = COL_HEALTHY, "NS" = COL_NS)) +
+      geom_vline(xintercept = 0, color = "grey30", linewidth = 0.15) +
+      geom_hline(yintercept = -log10(0.05), color = "grey30",
+                 linetype = "dashed", linewidth = 0.15) +
+      geom_text_repel(data = top_labels, aes(label = kinase),
+                      size = 5 / .pt, color = "black", fontface = "italic",
+                      box.padding = 0.15, point.padding = 0.2,
+                      segment.linewidth = 0.1, min.segment.length = 0,
+                      max.overlaps = 10) +
+      geom_text(data = count_df,
+                aes(x = x, y = y, label = paste0("n=", n), color = NULL),
+                color = count_df$color,
+                size = 5 / .pt, fontface = "bold") +
+      facet_grid(genotype ~ timepoint) +
+      labs(x = "KSEA z-score", y = "-log10(p-value)") +
+      THEME_PLOT +
+      theme(
+        legend.position = "none",
+        strip.text      = element_text(size = 5, face = "bold"),
+        panel.spacing   = unit(2, "pt")
+      )
+    
+    # Size: 4 rows × 3 cols of compact panels + margins
+    grid_w <- PLOT_W * 3 + 0.6
+    grid_h <- PLOT_H * 4 + 0.8
+    
+    ggsave(file.path(kinase_xdir, "ksea_volcano_faceted_grid.png"), p_grid,
+           width = grid_w, height = grid_h, units = "in", dpi = 300)
+    ggsave(file.path(kinase_xdir, "ksea_volcano_faceted_grid.pdf"), p_grid,
+           width = grid_w, height = grid_h, units = "in")
+    
+    cat(sprintf("  ✓ Faceted KSEA volcano grid: %d contrasts in %s × %s layout\n",
+                length(unique(plot_df$contrast)),
+                length(levels(plot_df$genotype)),
+                length(levels(plot_df$timepoint))))
+    
+  }, error = function(e) cat(sprintf("  ⚠ Faceted volcano grid failed: %s\n", e$message)))
+  
+} else {
+  cat("  ⚠ No KSEA results collected — skipping cross-contrast visualizations\n")
+}
 
 # ==============================================================================
 # SECTION 11: GLOBAL HEATMAPS PER TIMEPOINT
@@ -1801,6 +2032,10 @@ cat("      - ksea_volcano_compact.png/.pdf  (169×174 pt)\n")
 cat("      - kinase_method_comparison_heatmap.png/.pdf\n")
 cat("      - fgsea_hallmarks/kegg/reactome_results.csv + barplots\n")
 cat("      - progeny_pathway_activity.csv + barplot\n")
+cat("  Kinase_Cross_Contrast/:\n")
+cat("    • kinase_activity_heatmap_all_contrasts.png/.pdf\n")
+cat("    • kinase_zscore_matrix.csv\n")
+cat("    • ksea_volcano_faceted_grid.png/.pdf  (4×3 genotype×timepoint)\n")
 cat("  Timepoint_Contrasts/:\n")
 cat("    • D22_vs_D15, D29_vs_D15, D29_vs_D22 per genotype\n")
 cat("  Interaction_Model/:\n")
